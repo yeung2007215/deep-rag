@@ -1,0 +1,26 @@
+# deep-rag 桌遊規則問答系統 — 依賴套件
+# Python >= 3.10 required (LangChain 1.0+)
+
+# LangChain 核心框架
+langchain>=1.0.0
+langchain-core>=1.0.0
+langgraph>=1.0.0
+
+# 向量資料庫
+langchain-chroma>=0.2.0
+chromadb>=0.5.0
+
+# Embedding (Ollama 本地模型)
+langchain-ollama>=0.3.0
+
+# 文件載入與處理
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+unstructured>=0.16.0
+
+# BM25 檢索
+rank-bm25>=0.2.2
+
+# 環境變數管理
+python-dotenv>=1.0.0
+
