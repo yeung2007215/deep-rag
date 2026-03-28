@@ -12,7 +12,7 @@ from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
 from config import (
-    CHROMA_PERSIST_DIR, CHROMA_COLLECTION_NAME, EMBEDDING_MODEL, LLM_MODEL,
+    CHROMA_PERSIST_DIR, EMBEDDING_MODEL, LLM_MODEL,
     SIMILARITY_SEARCH_K, BM25_SEARCH_K, FINAL_TOP_K,
     DEEPRAG_MAX_ROUNDS, DEEPRAG_FOLLOWUP_N, DEEPRAG_MIN_CONTEXT_LENGTH,
     RERANK_TOP_K, RERANK_CONFIDENCE_THRESHOLD,
@@ -21,10 +21,11 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
-def get_vector_store() -> Chroma:
+def get_vector_store(collection_name: str) -> Chroma:
+    """取得指定 collection 的 ChromaDB 向量資料庫實例"""
     embedding = OllamaEmbeddings(model=EMBEDDING_MODEL)
     return Chroma(
-        collection_name=CHROMA_COLLECTION_NAME,
+        collection_name=collection_name,
         embedding_function=embedding,
         persist_directory=CHROMA_PERSIST_DIR,
     )

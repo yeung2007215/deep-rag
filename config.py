@@ -13,7 +13,28 @@ load_dotenv()
 # ==============================
 DOCS_DIR = os.getenv("DOCS_DIR", "./docs")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_langchain_db")
-CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "boardgame_rules_collection")
+
+# ==============================
+# 多遊戲集合定義 (Multi-collection)
+# ==============================
+# 每個遊戲對應一個獨立的 ChromaDB Collection
+# key: 遊戲識別碼, value: dict(name=顯示名稱, collection=集合名稱, file_keywords=檔名關鍵字)
+GAME_COLLECTIONS = {
+    "asteriated_grail": {
+        "name": "星杯傳說",
+        "collection": "asteriated_grail_collection",
+        "file_keywords": ["星杯傳說"],
+    },
+    "war_of_three_kingdoms": {
+        "name": "三國殺",
+        "collection": "war_of_the_three_kingdom_collection",
+        "file_keywords": ["三國殺"],
+    },
+}
+
+# 預設集合（向後相容）
+DEFAULT_GAME_KEY = os.getenv("DEFAULT_GAME_KEY", "asteriated_grail")
+CHROMA_COLLECTION_NAME = GAME_COLLECTIONS[DEFAULT_GAME_KEY]["collection"]
 
 # ==============================
 # Embedding 模型設定

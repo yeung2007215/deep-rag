@@ -20,7 +20,7 @@ from langchain_chroma import Chroma
 from config import (
     DOCS_DIR,
     CHROMA_PERSIST_DIR,
-    CHROMA_COLLECTION_NAME,
+    GAME_COLLECTIONS,
     EMBEDDING_MODEL,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
@@ -101,24 +101,57 @@ def get_existing_hashes(vector_store: Chroma) -> set[str]:
         return set()
 
 
-def create_vector_store() -> Chroma:
-    """建立或連接 ChromaDB 向量資料庫"""
+def create_vector_store(collection_name: str) -> Chroma:
+    """建立或連接指定名稱的 ChromaDB 向量資料庫"""
     embedding = OllamaEmbeddings(model=EMBEDDING_MODEL)
     return Chroma(
-        collection_name=CHROMA_COLLECTION_NAME,
+        collection_name=collection_name,
         embedding_function=embedding,
         persist_directory=CHROMA_PERSIST_DIR,
     )
 
 
-def ingest(docs_dir: str = DOCS_DIR, force: bool = False) -> Chroma:
+def _match_game_key(file_path: str) -> str | None:
+    """根據檔名關鍵字匹配對應的遊戲 key，無法匹配則回傳 None"""
+    basename = os.path.basename(file_path)
+    for game_key, game_info in GAME_COLLECTIONS.items():
+        for keyword in game_info["file_keywords"]:
+            if keyword in basename:
+                return game_key
+    return None
+
+
+def _ingest_to_collection(
+    collection_name: str, splits: list, force: bool = False
+) -> None:
+    """將 chunks 寫入指定的 collection（含去重）"""
+    if not splits:
+        return
+
+    vector_store = create_vector_store(collection_name)
+
+    if not force:
+        existing_hashes = get_existing_hashes(vector_store)
+        new_splits = [
+            s for s in splits
+            if s.metadata.get("content_hash") not in existing_hashes
+        ]
+        skipped = len(splits) - len(new_splits)
+        if skipped > 0:
+            logger.info(f"  跳過 {skipped} 個已存在的 chunks")
+    else:
+        new_splits = splits
+
+    if new_splits:
+        ids = vector_store.add_documents(documents=new_splits)
+        logger.info(f"  ✅ 寫入 {len(ids)} 個新 chunks → {collection_name}")
+    else:
+        logger.info(f"  無新 chunks 需要寫入 → {collection_name}")
+
+
+def ingest(docs_dir: str = DOCS_DIR, force: bool = False) -> None:
     """
-    主要入口：掃描文件 → 切分 → 去重 → 寫入 ChromaDB
-    Args:
-        docs_dir: 文件資料夾路徑
-        force: 是否強制重新寫入（忽略去重）
-    Returns:
-        ChromaDB vector_store 實例
+    主要入口：掃描文件 → 切分 → 按遊戲歸類 → 去重 → 寫入各自的 Collection
     """
     logger.info("=" * 50)
     logger.info("開始文件索引流程 (ingestion)")
@@ -128,37 +161,36 @@ def ingest(docs_dir: str = DOCS_DIR, force: bool = False) -> Chroma:
     file_paths = scan_markdown_files(docs_dir)
     if not file_paths:
         logger.warning(f"在 {docs_dir} 下未找到任何 .md 文件")
-        return create_vector_store()
+        return
 
     # 2. 讀取與切分
     all_splits = load_and_split_documents(file_paths)
     if not all_splits:
         logger.warning("所有文件切分後無內容")
-        return create_vector_store()
+        return
 
-    # 3. 連接向量資料庫
-    vector_store = create_vector_store()
+    # 3. 按遊戲歸類到不同 collection
+    collection_splits: dict[str, list] = {}
+    unmatched = []
 
-    # 4. 去重過濾
-    if not force:
-        existing_hashes = get_existing_hashes(vector_store)
-        new_splits = [s for s in all_splits if s.metadata.get("content_hash") not in existing_hashes]
-        skipped = len(all_splits) - len(new_splits)
-        if skipped > 0:
-            logger.info(f"跳過 {skipped} 個已存在的 chunks")
-    else:
-        new_splits = all_splits
-        logger.info("強制模式：跳過去重檢查")
+    for split in all_splits:
+        source_file = split.metadata.get("source_file", "")
+        game_key = _match_game_key(source_file)
+        if game_key:
+            col_name = GAME_COLLECTIONS[game_key]["collection"]
+            collection_splits.setdefault(col_name, []).append(split)
+        else:
+            unmatched.append(split)
 
-    # 5. 寫入 ChromaDB
-    if new_splits:
-        ids = vector_store.add_documents(documents=new_splits)
-        logger.info(f"✅ 成功寫入 {len(ids)} 個新 chunks 至 ChromaDB")
-    else:
-        logger.info("無新 chunks 需要寫入（所有文件已索引）")
+    if unmatched:
+        logger.warning(f"有 {len(unmatched)} 個 chunks 無法匹配遊戲，將跳過")
 
-    logger.info("索引流程完成")
-    return vector_store
+    # 4. 分別寫入各 collection
+    for col_name, splits in collection_splits.items():
+        logger.info(f"\n📦 索引至集合: {col_name} ({len(splits)} chunks)")
+        _ingest_to_collection(col_name, splits, force=force)
+
+    logger.info("\n✅ 所有集合索引流程完成")
 
 
 if __name__ == "__main__":

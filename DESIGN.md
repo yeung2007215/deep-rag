@@ -133,7 +133,66 @@ while True:
 
 ---
 
-## 三、整體設計邏輯（DeepRAG 流程）
+## 三、整體設計邏輯
+
+### 3.1 交互流程（兩層式選單）
+
+```
+程式啟動 (main.py)
+       │
+       ▼
+┌──────────────────────────────┐
+│  第一層：遊戲選擇選單         │
+│                              │
+│  1. 星杯傳說                  │
+│  2. 三國殺                    │
+│  輸入 quit 退出               │
+└────────────┬─────────────────┘
+             │ 使用者選擇編號
+             ▼
+┌──────────────────────────────┐
+│  連接對應 Collection          │
+│  → get_vector_store(col)     │
+│  → 建立 BM25 索引            │
+└────────────┬─────────────────┘
+             │
+             ▼
+┌──────────────────────────────┐
+│  第二層：問題諮詢循環         │
+│                              │
+│  ❓ [星杯傳說] 請輸入問題:    │
+│                              │
+│  → 輸入問題 → DeepRAG 檢索   │
+│  → 輸入 'back' → 返回第一層  │
+│  → 輸入 'quit' → 結束程式    │
+└──────────────────────────────┘
+```
+
+### 3.2 Multi-collection 架構
+
+```
+config.py 定義：
+
+  GAME_COLLECTIONS = {
+    "asteriated_grail": {
+        collection: "asteriated_grail_collection"
+        file_keywords: ["星杯傳說"]
+    },
+    "war_of_three_kingdoms": {
+        collection: "war_of_the_three_kingdom_collection"
+        file_keywords: ["三國殺"]
+    }
+  }
+
+ingestion 時：
+  星杯傳說_規則說明書.md  →  asteriated_grail_collection
+  三國殺_規則說明書.md    →  war_of_the_three_kingdom_collection
+
+檢索時：
+  使用者選遊戲 → 只連接對應 collection → 不會跨遊戲混淆
+```
+
+### 3.3 DeepRAG 檢索流程
 
 ```
 使用者輸入問題
@@ -192,12 +251,14 @@ while True:
 | **架構** | 單一腳本 | 4 個職責分離模組 |
 | **配置管理** | 硬編碼 | config.py + .env 支援 |
 | **支援遊戲** | 只有星杯傳說 | 星杯傳說 + 三國殺（自動掃描）|
+| **向量集合** | 單一 collection | 每個遊戲獨立 collection |
 | **重複索引** | 每次重複插入 | SHA-256 去重 |
 | **檢索方式** | 純向量搜尋 | BM25 + Vector 混合 |
 | **充足性判斷** | 只看字數 | LLM 分析關鍵實體 |
 | **Reranker** | 無 metadata / 無門檻 | 帶 game_name + 信心門檻 |
 | **異常處理** | 無，直接 crash | 每個 API 呼叫有 try/except + fallback |
-| **使用方式** | 改程式碼重跑 | 終端機交互 / CLI 參數 |
+| **使用方式** | 改程式碼重跑 | 兩層式交互選單 / CLI 參數 |
+| **導航** | 無 | back 返回上層 / quit 退出 |
 
 ---
 
@@ -207,16 +268,17 @@ while True:
 # 安裝依賴
 pip install -r requirements.txt
 
-# 首次索引文件（星杯傳說 + 三國殺）
+# 首次索引（自動歸類到各遊戲 collection）
 python main.py --ingest
 
-# 啟動交互式問答
+# 啟動交互式問答（兩層式選單）
 python main.py
 
-# 單次查詢
-python main.py --query "星杯傳說起始手牌幾張"
+# 單次查詢（指定遊戲）
+python main.py --query "起始手牌幾張" --game asteriated_grail
+python main.py --query "殺的使用規則" --game war_of_three_kingdoms
 
-# 強制重新索引（文件有更新時）
+# 強制重新索引
 python main.py --ingest --force
 ```
 
@@ -226,10 +288,10 @@ python main.py --ingest --force
 
 | 檔案 | 角色 | 狀態 |
 |------|------|------|
-| `config.py` | 配置中心 | ✅ 使用中 |
-| `ingestion.py` | 文件索引 | ✅ 使用中 |
-| `retriever.py` | 檢索核心 | ✅ 使用中 |
-| `main.py` | 程式入口 | ✅ 使用中 |
+| `config.py` | 配置中心（含多遊戲集合定義）| ✅ 使用中 |
+| `ingestion.py` | 文件索引（按遊戲歸類 collection）| ✅ 使用中 |
+| `retriever.py` | 檢索核心（支援動態 collection）| ✅ 使用中 |
+| `main.py` | 程式入口（兩層式選單）| ✅ 使用中 |
 | `requirements.txt` | 依賴清單 | ✅ 使用中 |
 | `ChromaDB.py` | 舊版索引腳本 | 🗑️ 可刪除 |
 | `Standard-RAG.py` | 舊版 RAG | 🗑️ 可刪除 |
