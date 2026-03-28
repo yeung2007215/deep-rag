@@ -9,11 +9,15 @@ main.py — DeepRAG 桌遊規則問答系統入口
 
 import logging
 import sys
+from typing import Optional
 
 from langchain.agents import create_agent
 
-from config import LLM_MODEL, GAME_COLLECTIONS
-from retriever import get_vector_store, get_all_documents, deep_rag_retrieve
+from config import LLM_MODEL, GAME_COLLECTIONS, CHAT_HISTORY_MAX_TURNS, MAX_CONTEXT_CHARS
+from retriever import (
+    get_vector_store, get_all_documents, deep_rag_retrieve,
+    build_bm25_retriever, ChatHistory,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,10 +30,16 @@ logger = logging.getLogger(__name__)
 # 回答生成
 # ==============================
 def build_answer_agent(context: str, question: str, game_name: str):
-    """根據檢索結果建立回答 agent"""
+    """根據檢索結果建立回答 agent（含 context 截斷保護）"""
+    # 截斷保護：避免超出 LLM context window
+    safe_context = context[:MAX_CONTEXT_CHARS]
+    if len(context) > MAX_CONTEXT_CHARS:
+        safe_context += f"\n…（以下省略，共 {len(context)} 字）"
+        logger.warning(f"Context 過長，截斷至 {MAX_CONTEXT_CHARS} 字 (原 {len(context)} 字)")
+
     system_prompt = f"""你是《{game_name}》規則助理。以下是從規則資料庫檢索到的內容：
 
-{context}
+{safe_context}
 
 請只根據以上內容回答：
 問題：{question}
@@ -41,12 +51,18 @@ def build_answer_agent(context: str, question: str, game_name: str):
     return create_agent(model=LLM_MODEL, system_prompt=system_prompt)
 
 
-def ask(question: str, vector_store, game_name: str,
-        bm25_docs=None, verbose: bool = True) -> str:
-    """完整的 DeepRAG 問答流程"""
-    # 1. DeepRAG 檢索
+def ask(
+    question: str,
+    vector_store,
+    game_name: str,
+    bm25_retriever=None,
+    chat_history: Optional[ChatHistory] = None,
+    verbose: bool = True,
+) -> str:
+    """完整的 DeepRAG 問答流程（支援對話歷史）"""
+    # 1. DeepRAG 檢索（傳入 chat_history 進行指代消解）
     final_context, all_queries, reranked_docs = deep_rag_retrieve(
-        question, vector_store, bm25_docs
+        question, vector_store, bm25_retriever, chat_history=chat_history
     )
 
     if not final_context or not final_context.strip():
@@ -55,6 +71,13 @@ def ask(question: str, vector_store, game_name: str,
     # 2. 顯示檢索資訊
     if verbose:
         print("\n" + "=" * 60)
+        # 若第一個 query 與原問題不同，表示發生了指代消解
+        if all_queries and all_queries[0] != question:
+            print(f"🔄 指代消解: 「{question}」")
+            print(f"          → 「{all_queries[0]}」")
+        history_len = len(chat_history) if chat_history else 0
+        if history_len > 0:
+            print(f"💬 對話歷史: 已記憶 {history_len} 輪 (最多保留 {CHAT_HISTORY_MAX_TURNS} 輪)")
         print("📋 DeepRAG 使用的查詢:")
         for i, q in enumerate(all_queries, 1):
             print(f"  [{i}] {q}")
@@ -127,19 +150,24 @@ def question_loop(game_key: str) -> bool:
     print(f"\n🔗 連接 {game_name} 向量資料庫 ({collection_name})...")
     vector_store = get_vector_store(collection_name)
 
-    # 建立 BM25 索引
+    # 建立 BM25 索引（只建一次，整個 session 複用）
     bm25_docs = get_all_documents(vector_store)
+    bm25_retriever = None
     if not bm25_docs:
         logger.warning(f"{game_name} 的索引為空。請先執行 `python main.py --ingest`。")
-        bm25_docs = None
     else:
+        bm25_retriever = build_bm25_retriever(bm25_docs)
         print(f"   📚 BM25 索引: {len(bm25_docs)} 個文件")
 
     print("\n" + "=" * 60)
     print(f"📖 目前遊戲: {game_name}")
-    print("   輸入 'back' 返回遊戲選擇")
+    print("   輸入 'back' 返回遊戲選擇（對話記憶將清除）")
     print("   輸入 'quit' 或 'exit' 退出程式")
+    print("   輸入 'history' 查看目前對話記憶")
     print("=" * 60)
+
+    # 對話歷史：每進入一個遊戲就重新開始累積
+    chat_history: ChatHistory = []
 
     while True:
         try:
@@ -152,16 +180,37 @@ def question_loop(game_key: str) -> bool:
             continue
 
         lower_q = question.lower()
+
         if lower_q == "back":
-            print(f"\n↩️  返回遊戲選擇...")
+            print(f"\n↩️  返回遊戲選擇... (已清除 {len(chat_history)} 輪對話記憶)")
             return True
+
         if lower_q in ("quit", "exit", "q"):
             print("\n👋 再見！")
             return False
 
+        if lower_q == "history":
+            if not chat_history:
+                print("  （目前沒有對話記憶）")
+            else:
+                print(f"\n💬 對話記憶（共 {len(chat_history)} 輪）：")
+                for i, (q, a) in enumerate(chat_history, 1):
+                    print(f"  [{i}] 問：{q}")
+                    print(f"       答：{a[:120]}{'...' if len(a) > 120 else ''}")
+            continue
+
         print("\n⏳ 正在檢索與分析中...\n")
-        answer = ask(question, vector_store, game_name, bm25_docs)
+        answer = ask(
+            question, vector_store, game_name,
+            bm25_retriever=bm25_retriever,
+            chat_history=chat_history,
+        )
         print(f"\n🤖 回答:\n{answer}")
+
+        # 將本輪問答加入歷史，超過上限時淘汰最舊的
+        chat_history.append((question, answer))
+        if len(chat_history) > CHAT_HISTORY_MAX_TURNS:
+            chat_history.pop(0)
 
 
 # ==============================
@@ -200,8 +249,9 @@ def main():
 
         game_info = GAME_COLLECTIONS[game_key]
         vs = get_vector_store(game_info["collection"])
-        bm25 = get_all_documents(vs) or None
-        answer = ask(question, vs, game_info["name"], bm25)
+        bm25 = build_bm25_retriever(get_all_documents(vs))
+        # CLI 單次查詢無對話歷史
+        answer = ask(question, vs, game_info["name"], bm25_retriever=bm25, chat_history=None)
         print(f"\n🤖 回答:\n{answer}")
         return
 
