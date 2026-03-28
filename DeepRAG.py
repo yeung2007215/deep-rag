@@ -6,51 +6,36 @@ load_dotenv()
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-# ==============================
-# Embedding / Vector DB
-# ==============================
+# Embedding / dynamic vector store
 embedding = OllamaEmbeddings(model="nomic-embed-text")
+current_vector_store = None
 
-vector_store = Chroma(
-    collection_name="asteriated_grail_collection",
-    embedding_function=embedding,
-    persist_directory="./chroma_langchain_db"
-)
+# Game collection mapping
+GAME_COLLECTIONS = {
+    "1": ("asteriated_grail_collection", "星杯傳說"),
+    "2": ("war_of_the_three_kingdom_collection", "三國殺")
+}
 
 
-# ==============================
-# Tool: retrieve from Chroma
-# ==============================
 @tool
 def get_rule(query: str) -> str:
-    """Retrieve information"""
-    retrieved_docs = vector_store.similarity_search(query, k=20)
-    results = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    return results
+    """從選定的桌遊規則資料庫中檢索資訊。"""
+    if current_vector_store is None:
+        return "尚未選擇遊戲，無法檢索。"
+
+    retrieved_docs = current_vector_store.similarity_search(query, k=20)
+    return "\n\n".join([doc.page_content for doc in retrieved_docs])
 
 
-# ==============================
-# DeepRAG helpers
-# ==============================
 def _is_context_sufficient(context: str) -> bool:
-    """
-    Very lightweight sufficiency check.
-    You can adjust thresholds as needed.
-    """
     if not context:
         return False
-    if len(context.strip()) < 120:
-        return False
-    return True
+    return len(context.strip()) >= 120
 
 
-def _generate_followup_queries(user_question: str, context: str, n: int = 3):
-    """
-    Use LLM to generate additional retrieval queries (thinking-to-retrieve).
-    Output: list of n queries, one per line.
-    """
+def _generate_followup_queries(user_question: str, context: str, game_name: str, n: int = 3):
     rewrite_system_prompt = f"""
-你是檢索 query 生成器。目標：為《星杯傳說》規則資料庫生成更精準的檢索查詢。
+你是檢索 query 生成器。目標：為《{game_name}》規則資料庫生成更精準的檢索查詢。
 你會收到：
 1) 原始問題
 2) 目前檢索到的內容（可能不足）
@@ -75,16 +60,11 @@ def _generate_followup_queries(user_question: str, context: str, n: int = 3):
 """
     rewrite_results = rewrite_agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
     text = rewrite_results["messages"][-1].content.strip()
-
     queries = [line.strip() for line in text.splitlines() if line.strip()]
     return queries[:n] if queries else []
 
 
 def deepseek_rerank_docs(user_question: str, docs, top_k: int = 5):
-    """
-    Use DeepSeek as a reranker to select the most relevant chunks.
-    Returns top_k documents (LangChain Document objects).
-    """
     if not docs:
         return []
 
@@ -111,11 +91,7 @@ def deepseek_rerank_docs(user_question: str, docs, top_k: int = 5):
     r = rerank_agent.invoke({"messages": [{"role": "user", "content": prompt}]})
     text = r["messages"][-1].content.strip().replace(" ", "")
 
-    idxs = []
-    for part in text.split(","):
-        if part.isdigit():
-            idxs.append(int(part))
-
+    idxs = [int(part) for part in text.split(",") if part.isdigit()]
     seen = set()
     picked = []
     for i in idxs:
@@ -128,125 +104,149 @@ def deepseek_rerank_docs(user_question: str, docs, top_k: int = 5):
     return [docs[i - 1] for i in picked]
 
 
-# ==============================
-# Agent invoke
-# ==============================
-user_question = "星杯傳說, 起始手牌幾張"
+def select_collection(choice: str):
+    if choice == "1" or "星杯" in choice:
+        return GAME_COLLECTIONS["1"]
+    if choice == "2" or "三國" in choice:
+        return GAME_COLLECTIONS["2"]
+    return None, None
 
-# First retrieval
-similarity_search_results = get_rule.invoke({"query": user_question})
-all_contexts = []
-all_queries = [user_question]
-seen_contexts = set()
 
-if similarity_search_results and similarity_search_results.strip():
-    all_contexts.append(similarity_search_results)
-    seen_contexts.add(similarity_search_results.strip())
+def init_vector_store(collection_name: str):
+    return Chroma(
+        collection_name=collection_name,
+        embedding_function=embedding,
+        persist_directory="./chroma_langchain_db"
+    )
 
-# DeepRAG iterative retrieval
-max_rounds = 20
-for _ in range(max_rounds):
-    merged_context = "\n\n---\n\n".join(all_contexts).strip()
 
-    if _is_context_sufficient(merged_context):
+print("=== 🦘 Welcome to BoardgameRoo DeepRAG ===")
+
+while True:
+    print("\n🕹️ Game list:")
+    print("[1] ⭐️ 星杯傳說 (asteriated_grail_collection)")
+    print("[2] ⚔️ 三國殺 (war_of_the_three_kingdom_collection)")
+    print("Input 'exit' to exit the program")
+
+    choice = input("\n🦘: Enter game number or name (1/2): ").strip()
+    if choice.lower() in ["exit", "quit", "退出"]:
         break
 
-    followups = _generate_followup_queries(user_question, merged_context, n=3)
-    if not followups:
-        break
+    target_collection, game_name = select_collection(choice)
+    if not target_collection:
+        print("[Error] Invalid choice, please retry.")
+        continue
 
-    for q in followups:
-        if q in all_queries:
+    current_vector_store = init_vector_store(target_collection)
+    print(f"\n🦘 You are in [{game_name}] rules mode.")
+    print("(Enter 'back' to return to game selection, 'exit' to quit program)")
+
+    while True:
+        question = input(f"\n[{game_name}] Your question: ").strip()
+        if not question:
             continue
-        all_queries.append(q)
+        if question.lower() == "back":
+            print("Back to game list...")
+            break
+        if question.lower() in ["exit", "quit", "退出"]:
+            print("Programme exiting...")
+            exit()
 
-        new_context = get_rule.invoke({"query": q})
-        if not new_context or not new_context.strip():
-            continue
+        similarity_search_results = get_rule.invoke({"query": question})
+        all_contexts = []
+        all_queries = [question]
+        seen_contexts = set()
 
-        key = new_context.strip()
-        if key in seen_contexts:
-            continue
-        seen_contexts.add(key)
-        all_contexts.append(new_context)
+        if similarity_search_results and similarity_search_results.strip():
+            all_contexts.append(similarity_search_results)
+            seen_contexts.add(similarity_search_results.strip())
 
-# Merge contexts (fallback if rerank fails)
-merged_context = "\n\n---\n\n".join([c for c in all_contexts if c and c.strip()]).strip()
+        max_rounds = 20
+        for _ in range(max_rounds):
+            merged_context = "\n\n---\n\n".join(all_contexts).strip()
+            if _is_context_sufficient(merged_context):
+                break
 
-# ==============================
-# DeepSeek rerank (collect candidates using all_queries)
-# ==============================
-candidate_docs_all = []
-seen_text = set()
+            followups = _generate_followup_queries(question, merged_context, game_name, n=3)
+            if not followups:
+                break
 
-for q in all_queries:
-    docs = vector_store.similarity_search(q, k=10)
-    for d in docs:
-        t = d.page_content.strip()
-        if not t:
-            continue
-        if t in seen_text:
-            continue
-        seen_text.add(t)
-        candidate_docs_all.append(d)
+            for q in followups:
+                if q in all_queries:
+                    continue
+                all_queries.append(q)
+                new_context = get_rule.invoke({"query": q})
+                if not new_context or not new_context.strip():
+                    continue
+                key = new_context.strip()
+                if key in seen_contexts:
+                    continue
+                seen_contexts.add(key)
+                all_contexts.append(new_context)
 
-reranked_docs = deepseek_rerank_docs(user_question, candidate_docs_all, top_k=5)
+        merged_context = "\n\n---\n\n".join([c for c in all_contexts if c and c.strip()]).strip()
+        candidate_docs_all = []
+        seen_text = set()
 
-if reranked_docs:
-    similarity_search_results = "\n\n---\n\n".join([d.page_content for d in reranked_docs]).strip()
-else:
-    similarity_search_results = merged_context
+        for q in all_queries:
+            docs = current_vector_store.similarity_search(q, k=10)
+            for d in docs:
+                t = d.page_content.strip()
+                if not t or t in seen_text:
+                    continue
+                seen_text.add(t)
+                candidate_docs_all.append(d)
 
+        reranked_docs = deepseek_rerank_docs(question, candidate_docs_all, top_k=5)
+        if reranked_docs:
+            similarity_search_results = "\n\n---\n\n".join([d.page_content for d in reranked_docs]).strip()
+        else:
+            similarity_search_results = merged_context
 
-# ==============================
-# Debug prints
-# ==============================
-if not similarity_search_results or not similarity_search_results.strip():
-    print("No relevant information found in the database.")
-else:
-    print("================similarity_search_results (DeepRAG merged + DeepSeek rerank)================\n")
-    print(similarity_search_results)
+        if not similarity_search_results or not similarity_search_results.strip():
+            print("警告：在資料庫中找不到相關片段，AI 將嘗試以現有知識回答。")
 
-    print("\n================DeepRAG queries used================\n")
-    for i, q in enumerate(all_queries, start=1):
-        print(f"[{i}] {q}")
-
-print("\n================DeepSeek rerank picked (top-k)================\n")
-if reranked_docs:
-    for i, d in enumerate(reranked_docs, start=1):
-        print(f"[{i}]")
-        print(d.page_content[:300])
-        print("metadata:", getattr(d, "metadata", None))
-        print("-----")
-else:
-    print("(rerank returned empty; using merged_context)")
-
-print("\n================RAG Answers================\n")
-
-
-# ==============================
-# Agent system prompt
-# ==============================
-system_prompt = f"""
-你是《星杯傳說》規則助理。以下是從規則資料庫檢索到的內容：
+        system_prompt = f"""
+你是《{game_name}》的桌遊規則助理。
+以下是從該遊戲規則資料庫檢索到的相關內容：
 {similarity_search_results}
 
 請只根據以上內容回答：
-問題：{user_question}
+問題：{question}
 
 要求：
 - 如可行，請引用你依據的規則句子（直接摘錄一小段即可）。
-- 如果以上內容不足以回答，請回答：資料庫未找到相關規則，並指出你缺少哪個關鍵資訊。
+- 如果以上內容不足以回答，請回答：在目前的規則書中找不到相關說明。
 """
 
-# Create agent
-agent = create_agent(
-    model="deepseek:deepseek-chat",
-    system_prompt=system_prompt,
-    tools=[get_rule]  #DeepRAG + rerank
-)
+        agent = create_agent(
+            model="deepseek:deepseek-chat",
+            system_prompt=system_prompt,
+            tools=[get_rule]
+        )
 
-# RAG Result
-results = agent.invoke({"messages": [{"role": "user", "content": user_question}]})
-messages = results["messages"]
-print("\nAI answer:", messages[-1].content)
+        try:
+            print("🤖 I am thinking...")
+            results = agent.invoke({"messages": [{"role": "user", "content": question}]})
+            ai_answer = results["messages"][-1].content
+
+            print("\n========= AI Answer =========")
+            print(ai_answer)
+            print("========= End =========\n")
+
+            
+
+            
+            # ==============================================================
+            # Only for develpr testing: print retrieved chunks for reference
+            retrieved_docs = current_vector_store.similarity_search(question, k=10)
+            print(f"\n[AI reference]: Found {len(retrieved_docs)} chunks")
+            for index, doc in enumerate(retrieved_docs, start=1):
+                source = doc.metadata.get('source', 'Unknown source') if hasattr(doc, 'metadata') else 'Unknown source'
+                print(f"=====[AI reference: Chunk no.{index}]=====")
+                print(f"Source: {source}")
+                print(f"Content: {doc.page_content[:500]}...")
+                print("[End of chunk]\n")
+
+        except Exception as e:
+            print(f"Error occurred: {e}")
