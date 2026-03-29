@@ -233,14 +233,31 @@ def get_all_documents(vector_store: Chroma) -> list[Document]:
         return []
 
 
+def _chinese_tokenize(text: str) -> list[str]:
+    """
+    中文逐字分詞 + 英數整詞保留。
+
+    預設 BM25 用 str.split()（按空格分詞），對中文完全無效：
+      "每位玩家摸取4張作為起始手牌" → ['每位玩家摸取4張作為起始手牌']（1 個 token）
+
+    本函式改為逐字拆分：
+      → ['每','位','玩','家','摸','取','4','張','作','為','起','始','手','牌']
+
+    這樣 query "起始手牌" 的 tokens ['起','始','手','牌'] 就能與文件匹配。
+    """
+    return re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", text.lower())
+
+
 def build_bm25_retriever(
     bm25_docs: list[Document], k: int = BM25_SEARCH_K
 ) -> Optional[BM25Retriever]:
-    """預先建立 BM25 索引（只需建一次，供多次查詢複用）"""
+    """預先建立 BM25 索引（使用中文逐字分詞）"""
     if not bm25_docs:
         return None
     try:
-        retriever = BM25Retriever.from_documents(bm25_docs)
+        retriever = BM25Retriever.from_documents(
+            bm25_docs, preprocess_func=_chinese_tokenize,
+        )
         retriever.k = k
         return retriever
     except Exception as e:
