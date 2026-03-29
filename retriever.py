@@ -15,9 +15,9 @@ from config import (
     CHROMA_PERSIST_DIR, EMBEDDING_MODEL, LLM_MODEL,
     SIMILARITY_SEARCH_K, BM25_SEARCH_K, FINAL_TOP_K,
     DEEPRAG_MAX_ROUNDS, DEEPRAG_FOLLOWUP_N, DEEPRAG_MIN_CONTEXT_LENGTH,
-    RERANK_TOP_K, RERANK_CONFIDENCE_THRESHOLD,
+    RERANK_TOP_K, RERANK_CONFIDENCE_THRESHOLD, RRF_K,
     CHAT_HISTORY_MAX_TURNS, CHAT_HISTORY_ANSWER_MAX_CHARS,
-    MAX_CONTEXT_CHARS, CANTONESE_TERM_MAP,
+    MAX_CONTEXT_CHARS, CANTONESE_TERM_MAP, CANTONESE_FUZZY_MAP,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,18 +58,32 @@ def _has_cantonese(text: str) -> bool:
 
 def expand_cantonese_terms(query: str) -> list[str]:
     """
-    利用術語對照表，將粵語關鍵字展開成書面語同義詞。
-    回傳展開後的額外 queries（原 query 不修改）。
+    利用術語對照表 + 拼音模糊映射表，展開粵語 query 為多個書面語 queries。
     用途：增強 BM25 關鍵字檢索在粵語環境下的命中率。
+
+    雙層展開：
+    1. CANTONESE_TERM_MAP：粵語語法詞 + 桌遊動作 → 書面語同義詞
+    2. CANTONESE_FUZZY_MAP：拼音近似/常見錯字 → 正確術語
     """
-    expanded_queries = []
+    expanded_queries = set()
+
+    # 層級 1：粵語術語 → 書面語
     for cantonese_term, standard_terms in CANTONESE_TERM_MAP.items():
         if cantonese_term in query:
             for std in standard_terms:
                 new_q = query.replace(cantonese_term, std)
-                if new_q != query and new_q not in expanded_queries:
-                    expanded_queries.append(new_q)
-    return expanded_queries
+                if new_q != query:
+                    expanded_queries.add(new_q)
+
+    # 層級 2：拼音近似 / 錯別字 → 正確術語
+    for fuzzy_term, correct_terms in CANTONESE_FUZZY_MAP.items():
+        if fuzzy_term in query:
+            for correct in correct_terms:
+                new_q = query.replace(fuzzy_term, correct)
+                if new_q != query:
+                    expanded_queries.add(new_q)
+
+    return list(expanded_queries)
 
 
 def rewrite_query_with_history(question: str, chat_history: ChatHistory) -> str:
@@ -112,9 +126,31 @@ def rewrite_query_with_history(question: str, chat_history: ChatHistory) -> str:
         agent = create_agent(model=LLM_MODEL, system_prompt=prompt_sys)
         r = agent.invoke({"messages": [{"role": "user", "content": user_content}]})
         rewritten = r["messages"][-1].content.strip()
-        if rewritten and rewritten != question:
-            logger.info(f"Query rewrite: 「{question}」→ 「{rewritten}」")
-        return rewritten or question
+
+        if not rewritten or rewritten == question:
+            return question
+
+        # ── 防語義漂移驗證 ────────────────────────────
+        # 如果改寫結果比原問題短太多（可能丟失資訊），回退
+        if len(rewritten) < len(question) * 0.3 and len(question) > 10:
+            logger.warning(f"改寫結果過短，疑似語義漂移，回退原問題: 「{rewritten}」")
+            return question
+
+        # 如果原問題含非指代的中文名詞（2+ 字），但改寫結果丟失了，回退
+        # 提取原問題中 >=2 字的非指代詞片段
+        original_terms = set(re.findall(r"[\u4e00-\u9fff]{2,}", question))
+        stopwords = {"如果", "那個", "什麼", "怎麼", "點樣", "幾多", "呢個", "嗰個"}
+        meaningful_terms = original_terms - stopwords
+        if meaningful_terms:
+            preserved = sum(1 for t in meaningful_terms if t in rewritten)
+            # 如果超過一半的實體詞被丟失，合併原問題和改寫結果
+            if preserved < len(meaningful_terms) * 0.5:
+                combined = f"{rewritten}（{question}）"
+                logger.info(f"改寫後丟失實體，合併: 「{combined}」")
+                return combined
+
+        logger.info(f"Query rewrite: 「{question}」→ 「{rewritten}」")
+        return rewritten
     except Exception as e:
         logger.warning(f"Query rewrite 失敗，使用原問題: {e}")
         return question
@@ -168,7 +204,11 @@ def hybrid_search(
     k_vector: int = SIMILARITY_SEARCH_K,
     final_k: int = FINAL_TOP_K,
 ) -> list[Document]:
-    """結合 BM25 + 向量語意檢索，去重合併"""
+    """
+    結合 BM25 + 向量語意檢索，使用 RRF (Reciprocal Rank Fusion) 加權合併。
+    RRF 公式：score(d) = Σ 1/(k + rank_i(d))
+    同時被兩個檢索器命中的文件會獲得更高分數。
+    """
     try:
         vector_results = vector_store.similarity_search(query, k=k_vector)
     except Exception as e:
@@ -182,15 +222,30 @@ def hybrid_search(
         except Exception as e:
             logger.warning(f"BM25 搜尋失敗: {e}")
 
-    seen, merged = set(), []
-    for doc in vector_results + bm25_results:
+    # RRF 加權合併
+    rrf_scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+
+    for rank, doc in enumerate(vector_results):
         key = doc.page_content.strip()
-        if key and key not in seen:
-            seen.add(key)
-            merged.append(doc)
-        if len(merged) >= final_k:
-            break
-    logger.info(f"混合檢索: vector={len(vector_results)}, bm25={len(bm25_results)}, merged={len(merged)}")
+        if not key:
+            continue
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+        doc_map[key] = doc
+
+    for rank, doc in enumerate(bm25_results):
+        key = doc.page_content.strip()
+        if not key:
+            continue
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+        if key not in doc_map:
+            doc_map[key] = doc
+
+    # 按 RRF 分數排序
+    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
+    merged = [doc_map[k] for k in sorted_keys[:final_k]]
+
+    logger.info(f"混合檢索(RRF): vector={len(vector_results)}, bm25={len(bm25_results)}, merged={len(merged)}")
     return merged
 
 

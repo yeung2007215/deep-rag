@@ -11,6 +11,7 @@ import glob
 import hashlib
 import logging
 import os
+import re
 
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -34,6 +35,15 @@ logger = logging.getLogger(__name__)
 def _content_hash(text: str) -> str:
     """產生文本內容的 SHA-256 hash，用於去重"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _strip_html_comments(text: str) -> str:
+    """
+    移除 Markdown 中的 HTML 註解（<!-- ... -->）。
+    星杯傳說規則書每個章節都嵌入了大量 section metadata 註解，
+    這些會浪費 chunk 空間且干擾 embedding 語義捕捉。
+    """
+    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
 
 
 def scan_markdown_files(docs_dir: str = DOCS_DIR) -> list[str]:
@@ -64,9 +74,14 @@ def load_and_split_documents(file_paths: list[str]) -> list:
         try:
             loader = UnstructuredMarkdownLoader(file_path)
             docs = loader.load()
+
+            # 預處理：清除 HTML 註解（避免 section metadata 浪費 chunk 空間）
+            for doc in docs:
+                doc.page_content = _strip_html_comments(doc.page_content)
+
             splits = text_splitter.split_documents(docs)
 
-            # 為每個 chunk 加入來源檔名 metadata
+            # 為每個 chunk 加入 metadata
             source_name = os.path.basename(file_path).replace("_規則說明書.md", "")
             for split in splits:
                 split.metadata["game_name"] = source_name

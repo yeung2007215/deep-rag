@@ -54,12 +54,14 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek:deepseek-chat")
 # ==============================
 # 文件切分參數
 # ==============================
-# 桌遊規則說明書建議：
-#   CHUNK_SIZE=300~500: 規則書段落通常短，太大會混入不相關規則
-#   CHUNK_OVERLAP=50~100: 足夠保留上下文連貫性
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
-CHUNK_SEPARATORS = ["\n\n", "\n", "。", "！", "？", " ", ""]
+# 桌遊規則書段落通常 100-300 字：
+#   CHUNK_SIZE=300: 精確切在規則段落邊界，避免跨段噪音
+#   CHUNK_OVERLAP=80: 保留上下文連貫（相鄰段落共享的過渡句）
+#   如果切出 chunk 太碎（段落本身 <100 字），overlap 可降到 50
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "300"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
+# 分隔符優先序：章節標題 > 段落 > 句號 > 逗號 > 空格
+CHUNK_SEPARATORS = ["\n## ", "\n### ", "\n\n", "\n", "。", "，", "！", "？", " ", ""]
 
 # ==============================
 # 檢索參數
@@ -86,8 +88,9 @@ DEEPRAG_MIN_CONTEXT_LENGTH = int(os.getenv("DEEPRAG_MIN_CONTEXT_LENGTH", "120"))
 # ==============================
 # 傳入 LLM 的最近幾輪對話（太多會超出 context window）
 CHAT_HISTORY_MAX_TURNS = int(os.getenv("CHAT_HISTORY_MAX_TURNS", "5"))
-# 每輪歷史回答的最大字元數（截斷保護，避免長回答爆 context window）
-CHAT_HISTORY_ANSWER_MAX_CHARS = int(os.getenv("CHAT_HISTORY_ANSWER_MAX_CHARS", "300"))
+# 每輪歷史回答的最大字元數
+# 300 太短可能遺失關鍵規則前提；500 可保留完整的規則結論
+CHAT_HISTORY_ANSWER_MAX_CHARS = int(os.getenv("CHAT_HISTORY_ANSWER_MAX_CHARS", "500"))
 # Context 傳入 LLM 的最大字元數（DeepSeek context window ≈ 64K tokens ≈ 32K 中文字）
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "8000"))
 
@@ -97,23 +100,15 @@ MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "8000"))
 # 用於 BM25 query 展開：將粵語關鍵字替換/追加書面語同義詞
 # 格式：粵語 → 書面語（可一對多）
 CANTONESE_TERM_MAP: dict[str, list[str]] = {
-    # 通用桌遊術語
+    # ── 粵語語法詞 ──
     "點樣": ["如何", "怎麼"],
     "點先": ["怎樣才能", "如何才能"],
     "幾多": ["多少"],
-    "幾張": ["多少張", "幾張"],
+    "幾張": ["多少張"],
     "攞": ["拿", "取得", "獲得"],
     "擺": ["放置", "放"],
     "掟": ["丟棄", "棄置"],
     "揀": ["選擇", "挑選"],
-    "贏": ["勝利", "獲勝"],
-    "輸": ["落敗", "失敗"],
-    "出牌": ["打出", "使用"],
-    "派牌": ["發牌", "分配手牌"],
-    "洗牌": ["洗牌", "重新洗混"],
-    "摸牌": ["抽牌", "摸牌"],
-    "手牌": ["手牌", "手中的牌"],
-    "回合": ["回合", "輪次"],
     "嘅": ["的"],
     "佢": ["他", "她", "它"],
     "咗": ["了"],
@@ -127,12 +122,68 @@ CANTONESE_TERM_MAP: dict[str, list[str]] = {
     "乜嘢": ["什麼"],
     "邊個": ["誰", "哪個"],
     "幾時": ["什麼時候", "何時"],
+    # ── 通用桌遊動作 ──
+    "贏": ["勝利", "獲勝"],
+    "輸": ["落敗", "失敗"],
+    "出牌": ["打出", "使用"],
+    "派牌": ["發牌", "分配手牌"],
+    "洗牌": ["洗牌", "重新洗混"],
+    "摸牌": ["抽牌", "摸牌"],
+    "手牌": ["手牌", "手中的牌"],
+    "回合": ["回合", "輪次"],
+    # ── 三國殺專有術語 ──
+    "殺": ["殺"],
+    "閃": ["閃"],
+    "桃": ["桃"],
+    "錦囊": ["錦囊牌"],
+    "裝備": ["裝備牌"],
+    "判定": ["判定", "進行判定"],
+    "拼點": ["拼點"],
+    "翻面": ["翻面", "武將牌翻面"],
+    "棄牌": ["棄牌", "棄置手牌"],
+    "主公": ["主公"],
+    "忠臣": ["忠臣"],
+    "反賊": ["反賊"],
+    "內奸": ["內奸"],
+    # ── 星杯傳說專有術語 ──
+    "星杯": ["星杯"],
+    "星石": ["星石", "寶石", "水晶"],
+    "士氣": ["士氣"],
+    "陣營": ["陣營", "陣營卡"],
+    "治療": ["治療", "治療卡"],
+    "行動": ["行動", "行動卡"],
+    "法術": ["法術", "法術卡"],
+    "特技": ["特技", "技能"],
+}
+
+# ── 拼音近似映射表 ──
+# 粵語拼音口語常見「聽起來像」的錯別字 → 正確術語
+# 用於 BM25 模糊匹配：即使使用者打錯字也能命中
+CANTONESE_FUZZY_MAP: dict[str, list[str]] = {
+    "錦朗": ["錦囊"],
+    "金囊": ["錦囊"],
+    "裝杯": ["裝備"],
+    "星杯": ["星杯"],
+    "星悲": ["星杯"],
+    "星石": ["星石"],
+    "星蝕": ["星石"],
+    "判定": ["判定"],
+    "叛定": ["判定"],
+    "士氣": ["士氣"],
+    "仕氣": ["士氣"],
+    "陣形": ["陣營"],
+    "陳營": ["陣營"],
 }
 
 # ==============================
 # Rerank 參數
 # ==============================
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
-# Rerank 信心門檻（0~1，低於此門檻的候選段落不納入）
-RERANK_CONFIDENCE_THRESHOLD = float(os.getenv("RERANK_CONFIDENCE_THRESHOLD", "0.3"))
+# Rerank 信心門檻（0~1）
+# 0.3 過低 → 大量低相關段落進入 context 干擾生成
+# 0.5 為建議值 → 只保留「直接相關 or 需推理」的段落
+RERANK_CONFIDENCE_THRESHOLD = float(os.getenv("RERANK_CONFIDENCE_THRESHOLD", "0.5"))
+# RRF (Reciprocal Rank Fusion) 常數 k，用於混合檢索加權合併
+# k 越大，排名差異的影響越平滑
+RRF_K = int(os.getenv("RRF_K", "60"))
 
