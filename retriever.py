@@ -19,7 +19,7 @@ from config import (
     RERANK_TOP_K, RERANK_CONFIDENCE_THRESHOLD, RRF_K,
     CHAT_HISTORY_MAX_TURNS, CHAT_HISTORY_ANSWER_MAX_CHARS,
     MAX_CONTEXT_CHARS, CANTONESE_TERM_MAP, CANTONESE_FUZZY_MAP,
-    QUERY_CLASSIFY_ENABLED,
+    PLAYER_SLANG_MAP, QUERY_CLASSIFY_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,67 +106,132 @@ def _has_cantonese(text: str) -> bool:
     return any(marker in text for marker in cantonese_markers)
 
 
-def expand_cantonese_terms(query: str) -> list[str]:
-    """
-    利用術語對照表 + 拼音模糊映射表，展開粵語 query 為多個書面語 queries。
-    用途：增強 BM25 關鍵字檢索在粵語環境下的命中率。
+def _has_player_slang(text: str) -> bool:
+    """快速偵測文本是否包含玩家俗語（非規則書官方術語）"""
+    return any(slang in text for slang in PLAYER_SLANG_MAP)
 
-    雙層展開：
-    1. CANTONESE_TERM_MAP：粵語語法詞 + 桌遊動作 → 書面語同義詞
-    2. CANTONESE_FUZZY_MAP：拼音近似/常見錯字 → 正確術語
+
+def expand_query_terms(query: str) -> list[str]:
+    """
+    統一術語展開：將使用者的口語/俗語/粵語 query 展開為多個官方術語 queries。
+    同時查四張映射表，確保所有層面的術語斷裂都被修補。
+
+    四層展開（越靠前優先級越高）：
+    1. PLAYER_SLANG_MAP：玩家俗語 → 規則書術語（「反彈」→「應戰」）
+    2. CANTONESE_TERM_MAP：粵語語法詞 → 書面語（「唔」→「不」）
+    3. CANTONESE_FUZZY_MAP：拼音錯別字 → 正確術語（「錦朗」→「錦囊」）
+    4. 組合展開：先套用俗語，再套用粵語（處理「唔可以反彈」→「不可以應戰」）
     """
     expanded_queries = set()
 
-    # 層級 1：粵語術語 → 書面語
-    for cantonese_term, standard_terms in CANTONESE_TERM_MAP.items():
-        if cantonese_term in query:
-            for std in standard_terms:
-                new_q = query.replace(cantonese_term, std)
-                if new_q != query:
-                    expanded_queries.add(new_q)
+    def _apply_map(q: str, mapping: dict[str, list[str]]) -> set[str]:
+        results = set()
+        for term, replacements in mapping.items():
+            if term in q:
+                for repl in replacements:
+                    new_q = q.replace(term, repl)
+                    if new_q != q:
+                        results.add(new_q)
+        return results
 
-    # 層級 2：拼音近似 / 錯別字 → 正確術語
-    for fuzzy_term, correct_terms in CANTONESE_FUZZY_MAP.items():
-        if fuzzy_term in query:
-            for correct in correct_terms:
-                new_q = query.replace(fuzzy_term, correct)
-                if new_q != query:
-                    expanded_queries.add(new_q)
+    # 層級 1：玩家俗語 → 官方術語（最重要）
+    slang_expanded = _apply_map(query, PLAYER_SLANG_MAP)
+    expanded_queries.update(slang_expanded)
+
+    # 層級 2：粵語語法詞 → 書面語
+    cantonese_expanded = _apply_map(query, CANTONESE_TERM_MAP)
+    expanded_queries.update(cantonese_expanded)
+
+    # 層級 3：拼音錯別字 → 正確術語
+    fuzzy_expanded = _apply_map(query, CANTONESE_FUZZY_MAP)
+    expanded_queries.update(fuzzy_expanded)
+
+    # 層級 4：組合展開 — 對俗語展開的結果再套用粵語轉換
+    # 解決「唔可以反彈」→ 先變「唔可以應戰」→ 再變「不可以應戰」
+    for sq in list(slang_expanded):
+        combo = _apply_map(sq, CANTONESE_TERM_MAP)
+        expanded_queries.update(combo)
+
+    # 對粵語展開的結果再套用俗語轉換
+    # 解決「可唔可以反彈」→ 先變「可不可以反彈」→ 再變「可不可以應戰」
+    for cq in list(cantonese_expanded):
+        combo = _apply_map(cq, PLAYER_SLANG_MAP)
+        expanded_queries.update(combo)
+
+    if expanded_queries:
+        logger.info(f"術語展開: {len(expanded_queries)} 條 ← 「{query}」")
 
     return list(expanded_queries)
 
 
 def rewrite_query_with_history(question: str, chat_history: ChatHistory) -> str:
     """
-    Query 改寫：指代消解 + 廣東話轉書面語。
+    語義標準化引擎（Semantic Normalization Engine）。
 
-    功能：
-    1. 指代消解：「那三國殺呢？」→「三國殺的起始手牌是幾張？」
-    2. 粵語轉換：「點樣先贏？」→「勝利條件是什麼？」
+    三層職責：
+    1. 粵語口語 → 標準書面語（「點樣先贏」→「勝利條件是什麼」）
+    2. 玩家俗語 → 規則書術語（「反彈」→「應戰」、「扣血」→「降低士氣」）
+    3. 指代消解（「那三國殺呢？」→「三國殺的起始手牌是幾張？」）
+
+    設計原則：
+    - LLM 改寫負責「語義理解」：能推論出手動映射表覆蓋不到的俗語
+    - expand_query_terms 負責「精確匹配」：確保已知的術語一定被替換
+    - 兩軌並行，互為安全網
     """
-    # 判斷是否需要改寫
+
+    # ── 觸發判斷 ──────────────────────────────────────
     anaphora_indicators = ["那", "它", "這", "呢", "如果是", "同樣", "也", "又", "換"]
+    has_history = bool(chat_history)
     is_short = len(question) <= 20
     has_anaphora = any(ind in question for ind in anaphora_indicators)
     has_cantonese = _has_cantonese(question)
-    has_history = bool(chat_history)
+    has_slang = _has_player_slang(question)
 
-    # 需要改寫的情況：有歷史+有指代 or 有歷史+太短 or 有粵語
-    needs_rewrite = (has_history and (has_anaphora or is_short)) or has_cantonese
+    needs_rewrite = (
+        has_cantonese             # 偵測到粵語 → 強制改寫
+        or has_slang              # 偵測到玩家俗語 → 強制改寫
+        or (has_history and (has_anaphora or is_short))  # 有歷史+指代/太短
+    )
+
     if not needs_rewrite:
         return question
 
+    # ── 觸發原因日誌 ──────────────────────────────────
+    triggers = []
+    if has_cantonese:  triggers.append("粵語")
+    if has_slang:      triggers.append("俗語")
+    if has_anaphora:   triggers.append("指代")
+    if is_short:       triggers.append("過短")
+    logger.info(f"語義標準化觸發 [{'+'.join(triggers)}]: 「{question}」")
+
     history_str = _format_chat_history(chat_history) if chat_history else ""
 
-    # 構建 prompt（根據情境調整指令）
-    rules = [
-        "1. 如果問題包含廣東話/粵語口語，改寫成標準中文書面語（例：「點樣先贏」→「勝利條件是什麼」）",
-        "2. 如果問題有指代詞（那、它、這、呢等），用對話歷史中的具體主詞替換",
-        "3. 保留使用者意圖中的新增條件或轉折",
-        "4. 如果問題已完整清晰（非口語、無指代），直接回傳原問題",
-        "5. 只輸出改寫後的問題，不要解釋、不要加引號",
-    ]
-    prompt_sys = "你是查詢改寫助理。將使用者的口語化或模糊問題改寫成適合檢索規則資料庫的標準中文。\n\n規則：\n" + "\n".join(rules)
+    # ── LLM Prompt：桌遊術語翻譯官 ───────────────────
+    prompt_sys = (
+        "你是桌遊規則術語翻譯官。你的任務是將玩家的口語化提問改寫成「規則書會使用的標準用語」，"
+        "使改寫後的問題能精確匹配桌遊規則資料庫中的內容。\n\n"
+        "你必須同時處理以下三類轉換：\n\n"
+        "【A. 廣東話口語 → 標準書面語】\n"
+        "  「點樣先贏」→「勝利條件是什麼」\n"
+        "  「攞幾多張」→「取得多少張」\n"
+        "  「可唔可以」→「可不可以」\n\n"
+        "【B. 玩家俗語 → 規則書術語】（最重要！）\n"
+        "  「反彈」→「應戰」\n"
+        "  「扣血」→「降低士氣」或「失去體力」\n"
+        "  「回血」→「治療」或「回復體力」\n"
+        "  「擋」→「抵擋」或「使用聖盾/聖光」\n"
+        "  「炸牌」→「棄置」或「移除」\n"
+        "  「吃傷」→「承受傷害」或「攻擊命中」\n"
+        "  「打回去」→「應戰」\n"
+        "  「免傷」→「抵禦」或「防止傷害」\n"
+        "  如果你不確定對應的規則書術語，保留原詞不改。\n\n"
+        "【C. 指代消解】\n"
+        "  如果有對話歷史，將「那」「它」「這」「呢」等指代詞替換為具體的主詞。\n\n"
+        "改寫規則：\n"
+        "1. 改寫後必須保留原問題中的實體名（遊戲名、角色名、卡牌名）\n"
+        "2. 如果原問題已經是規則書的標準用語，直接回傳原問題\n"
+        "3. 只輸出改寫後的問題，不要解釋、不要加引號、不要加句號"
+    )
 
     user_content = f"使用者問題：{question}"
     if history_str:
@@ -181,28 +246,32 @@ def rewrite_query_with_history(question: str, chat_history: ChatHistory) -> str:
             return question
 
         # ── 防語義漂移驗證 ────────────────────────────
-        # 如果改寫結果比原問題短太多（可能丟失資訊），回退
+        # 改寫結果過短（可能丟失資訊）→ 回退
         if len(rewritten) < len(question) * 0.3 and len(question) > 10:
-            logger.warning(f"改寫結果過短，疑似語義漂移，回退原問題: 「{rewritten}」")
+            logger.warning(f"改寫結果過短，疑似語義漂移，回退: 「{rewritten}」")
             return question
 
-        # 如果原問題含非指代的中文名詞（2+ 字），但改寫結果丟失了，回退
-        # 提取原問題中 >=2 字的非指代詞片段
+        # 實體保留檢查：提取原問題中 >=2 字的中文名詞
         original_terms = set(re.findall(r"[\u4e00-\u9fff]{2,}", question))
-        stopwords = {"如果", "那個", "什麼", "怎麼", "點樣", "幾多", "呢個", "嗰個"}
-        meaningful_terms = original_terms - stopwords
+        # 排除語法詞和觸發詞（這些「被改掉」是正確行為）
+        ignorable = {
+            "如果", "那個", "什麼", "怎麼", "可以", "不可以",
+            "點樣", "幾多", "呢個", "嗰個", "乜嘢",  # 粵語
+        }
+        # 排除已知俗語（這些被改成規則書術語是正確行為）
+        ignorable.update(PLAYER_SLANG_MAP.keys())
+        meaningful_terms = original_terms - ignorable
         if meaningful_terms:
             preserved = sum(1 for t in meaningful_terms if t in rewritten)
-            # 如果超過一半的實體詞被丟失，合併原問題和改寫結果
             if preserved < len(meaningful_terms) * 0.5:
                 combined = f"{rewritten}（{question}）"
                 logger.info(f"改寫後丟失實體，合併: 「{combined}」")
                 return combined
 
-        logger.info(f"Query rewrite: 「{question}」→ 「{rewritten}」")
+        logger.info(f"語義標準化: 「{question}」→ 「{rewritten}」")
         return rewritten
     except Exception as e:
-        logger.warning(f"Query rewrite 失敗，使用原問題: {e}")
+        logger.warning(f"語義標準化失敗，使用原問題: {e}")
         return question
 
 
@@ -461,11 +530,11 @@ def _standard_retrieve(
     docs = hybrid_search(resolved_question, vector_store, bm25_retriever)
     all_queries = [resolved_question]
 
-    # 粵語展開（仍然保留，只影響候選池不影響迭代）
+    # 術語展開（俗語+粵語+拼音，只影響候選池不影響迭代）
     candidate_docs: list[Document] = list(docs)
     seen_texts = {d.page_content.strip() for d in docs}
 
-    for exp_q in expand_cantonese_terms(resolved_question):
+    for exp_q in expand_query_terms(resolved_question):
         if exp_q not in all_queries:
             all_queries.append(exp_q)
             for d in hybrid_search(exp_q, vector_store, bm25_retriever):
@@ -522,8 +591,8 @@ def _deep_retrieve(
 
     _collect(initial_docs)
 
-    # ── 步驟 1b：粵語 BM25 展開搜尋 ──────────────────
-    for exp_q in expand_cantonese_terms(original_question):
+    # ── 步驟 1b：術語展開搜尋（俗語+粵語+拼音） ──
+    for exp_q in expand_query_terms(original_question):
         if exp_q not in all_queries:
             all_queries.append(exp_q)
             _collect(hybrid_search(exp_q, vector_store, bm25_retriever))
