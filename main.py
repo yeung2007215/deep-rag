@@ -59,9 +59,9 @@ def ask(
     chat_history: Optional[ChatHistory] = None,
     verbose: bool = True,
 ) -> str:
-    """完整的 DeepRAG 問答流程（支援對話歷史）"""
-    # 1. DeepRAG 檢索（傳入 chat_history 進行指代消解）
-    final_context, all_queries, reranked_docs = deep_rag_retrieve(
+    """完整的問答流程（智慧路由 Standard / DeepRAG）"""
+    # 1. 智慧路由檢索（回傳第 4 個值 = 問題分類）
+    final_context, all_queries, reranked_docs, query_type = deep_rag_retrieve(
         question, vector_store, bm25_retriever, chat_history=chat_history
     )
 
@@ -70,15 +70,23 @@ def ask(
 
     # 2. 顯示檢索資訊
     if verbose:
+        # 路徑標籤
+        path_labels = {
+            "FACTOID": "⚡ Standard（事實查詢，不迭代）",
+            "PROCEDURAL": "🔄 DeepRAG 輕量（流程步驟，1 輪迭代）",
+            "REASONING": "🧠 DeepRAG 完整（推理分析，最多 3 輪）",
+            "COMPARISON": "⚖️  DeepRAG 完整（跨規則比較，最多 3 輪）",
+        }
         print("\n" + "=" * 60)
-        # 若第一個 query 與原問題不同，表示發生了指代消解
+        print(f"🏷️  問題分類: {path_labels.get(query_type, query_type)}")
+        # 指代消解顯示
         if all_queries and all_queries[0] != question:
             print(f"🔄 指代消解: 「{question}」")
             print(f"          → 「{all_queries[0]}」")
         history_len = len(chat_history) if chat_history else 0
         if history_len > 0:
             print(f"💬 對話歷史: 已記憶 {history_len} 輪 (最多保留 {CHAT_HISTORY_MAX_TURNS} 輪)")
-        print("📋 DeepRAG 使用的查詢:")
+        print(f"📋 使用的查詢 ({len(all_queries)} 條):")
         for i, q in enumerate(all_queries, 1):
             print(f"  [{i}] {q}")
         print(f"\n📊 Rerank 結果: {len(reranked_docs)} 段")

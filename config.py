@@ -74,10 +74,21 @@ BM25_SEARCH_K = int(os.getenv("BM25_SEARCH_K", "15"))
 FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "10"))
 
 # ==============================
+# 問題複雜度分類 (Query Complexity Routing)
+# ==============================
+# FACTOID  → 事實查詢（「起始手牌幾張」）→ Standard 路徑
+# REASONING → 推理分析（「如果主公死了忠臣怎辦」）→ DeepRAG 路徑
+# COMPARISON → 跨規則比較（「星杯和三國殺哪個更複雜」）→ DeepRAG 路徑
+# PROCEDURAL → 流程步驟（「一個回合的完整流程」）→ DeepRAG 輕量路徑（1 輪）
+QUERY_CLASSIFY_ENABLED = os.getenv("QUERY_CLASSIFY_ENABLED", "true").lower() == "true"
+
+# ==============================
 # DeepRAG 迭代參數
 # ==============================
 # 最大迭代輪數
 DEEPRAG_MAX_ROUNDS = int(os.getenv("DEEPRAG_MAX_ROUNDS", "3"))
+# PROCEDURAL 類型的迭代輪數（較少，避免噪音）
+DEEPRAG_PROCEDURAL_ROUNDS = int(os.getenv("DEEPRAG_PROCEDURAL_ROUNDS", "1"))
 # 每輪產生的 follow-up query 數量
 DEEPRAG_FOLLOWUP_N = int(os.getenv("DEEPRAG_FOLLOWUP_N", "3"))
 # Context 充足性最低字數門檻

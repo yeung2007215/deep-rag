@@ -14,10 +14,12 @@ from langchain_ollama import OllamaEmbeddings
 from config import (
     CHROMA_PERSIST_DIR, EMBEDDING_MODEL, LLM_MODEL,
     SIMILARITY_SEARCH_K, BM25_SEARCH_K, FINAL_TOP_K,
-    DEEPRAG_MAX_ROUNDS, DEEPRAG_FOLLOWUP_N, DEEPRAG_MIN_CONTEXT_LENGTH,
+    DEEPRAG_MAX_ROUNDS, DEEPRAG_PROCEDURAL_ROUNDS,
+    DEEPRAG_FOLLOWUP_N, DEEPRAG_MIN_CONTEXT_LENGTH,
     RERANK_TOP_K, RERANK_CONFIDENCE_THRESHOLD, RRF_K,
     CHAT_HISTORY_MAX_TURNS, CHAT_HISTORY_ANSWER_MAX_CHARS,
     MAX_CONTEXT_CHARS, CANTONESE_TERM_MAP, CANTONESE_FUZZY_MAP,
+    QUERY_CLASSIFY_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,54 @@ def _format_chat_history(chat_history: ChatHistory) -> str:
             truncated_a += "…（截斷）"
         lines.append(f"[輪{i}] 助理：{truncated_a}")
     return "\n".join(lines)
+
+
+# ==============================
+# 問題複雜度分類器 (Query Complexity Classifier)
+# ==============================
+# 四種類型對應不同檢索策略
+QUERY_TYPE_FACTOID = "FACTOID"           # 事實查詢 → Standard 路徑
+QUERY_TYPE_PROCEDURAL = "PROCEDURAL"     # 流程步驟 → DeepRAG 輕量（1 輪）
+QUERY_TYPE_REASONING = "REASONING"       # 推理分析 → DeepRAG 完整
+QUERY_TYPE_COMPARISON = "COMPARISON"     # 跨規則比較 → DeepRAG 完整
+
+
+def classify_query_complexity(question: str) -> str:
+    """
+    使用 LLM 判斷問題類型，決定走哪條檢索路徑。
+
+    Returns: FACTOID / PROCEDURAL / REASONING / COMPARISON
+    """
+    if not QUERY_CLASSIFY_ENABLED:
+        return QUERY_TYPE_REASONING  # 分類關閉時預設走 DeepRAG
+
+    prompt_sys = (
+        "你是問題分類器。判斷使用者的桌遊規則問題屬於哪一類，只輸出一個英文單詞。\n\n"
+        "分類標準：\n"
+        "FACTOID — 查詢單一事實或數值（「起始手牌幾張」「最多幾個玩家」「殺的距離」）\n"
+        "PROCEDURAL — 詢問流程或步驟（「一個回合怎麼進行」「出牌階段的順序」）\n"
+        "REASONING — 需要結合多條規則推理（「如果主公死了忠臣會怎樣」「裝備被拆了技能還有效嗎」）\n"
+        "COMPARISON — 比較不同遊戲或規則（「星杯和三國殺哪個更複雜」「兩個遊戲的手牌上限差多少」）\n\n"
+        "只輸出一個詞：FACTOID 或 PROCEDURAL 或 REASONING 或 COMPARISON"
+    )
+
+    try:
+        agent = create_agent(model=LLM_MODEL, system_prompt=prompt_sys)
+        r = agent.invoke({"messages": [{"role": "user", "content": question}]})
+        answer = r["messages"][-1].content.strip().upper()
+
+        # 提取有效分類
+        for qtype in [QUERY_TYPE_FACTOID, QUERY_TYPE_PROCEDURAL,
+                       QUERY_TYPE_REASONING, QUERY_TYPE_COMPARISON]:
+            if qtype in answer:
+                logger.info(f"問題分類: {qtype} ← 「{question}」")
+                return qtype
+
+        logger.warning(f"分類結果無法辨識 ({answer})，預設 REASONING")
+        return QUERY_TYPE_REASONING
+    except Exception as e:
+        logger.warning(f"問題分類失敗，預設 REASONING: {e}")
+        return QUERY_TYPE_REASONING
 
 
 def _has_cantonese(text: str) -> bool:
@@ -377,31 +427,63 @@ def generate_followup_queries(
 
 
 # ==============================
-# DeepRAG 主流程
+# Standard RAG 路徑（FACTOID 用）
 # ==============================
-def deep_rag_retrieve(
-    question: str,
+def _standard_retrieve(
+    resolved_question: str,
+    vector_store: Chroma,
+    bm25_retriever: Optional[BM25Retriever] = None,
+) -> tuple[str, list[str], list[Document]]:
+    """
+    Standard RAG：hybrid_search → Rerank → 完成。
+    不做多輪迭代，不做充足性判斷，不生成 follow-up。
+    適用於 FACTOID 類型的簡單事實查詢。
+    """
+    logger.info(f"Standard 路徑開始: 「{resolved_question}」")
+
+    docs = hybrid_search(resolved_question, vector_store, bm25_retriever)
+    all_queries = [resolved_question]
+
+    # 粵語展開（仍然保留，只影響候選池不影響迭代）
+    candidate_docs: list[Document] = list(docs)
+    seen_texts = {d.page_content.strip() for d in docs}
+
+    for exp_q in expand_cantonese_terms(resolved_question):
+        if exp_q not in all_queries:
+            all_queries.append(exp_q)
+            for d in hybrid_search(exp_q, vector_store, bm25_retriever):
+                t = d.page_content.strip()
+                if t and t not in seen_texts:
+                    seen_texts.add(t)
+                    candidate_docs.append(d)
+
+    # Rerank
+    reranked = llm_rerank(resolved_question, candidate_docs)
+    if reranked:
+        final = "\n\n---\n\n".join([d.page_content for d in reranked]).strip()
+    else:
+        final = "\n\n---\n\n".join([d.page_content for d in docs if d.page_content.strip()]).strip()
+
+    logger.info(f"Standard 完成: {len(all_queries)} queries, {len(reranked)} 段")
+    return final, all_queries, reranked
+
+
+# ==============================
+# DeepRAG 路徑（REASONING / COMPARISON / PROCEDURAL 用）
+# ==============================
+def _deep_retrieve(
+    resolved_question: str,
+    original_question: str,
     vector_store: Chroma,
     bm25_retriever: Optional[BM25Retriever] = None,
     chat_history: Optional[ChatHistory] = None,
+    max_rounds: int = DEEPRAG_MAX_ROUNDS,
 ) -> tuple[str, list[str], list[Document]]:
     """
-    DeepRAG: 多輪迭代檢索 + 混合搜尋 + Rerank
-
-    Args:
-        bm25_retriever: 預建的 BM25 索引（用 build_bm25_retriever 建立）
-        chat_history: 對話歷史，用於指代消解
-
-    Returns: (final_context, all_queries, reranked_docs)
-    其中 all_queries[0] 為改寫後的最終查詢問題
+    DeepRAG：hybrid_search → 多輪迭代 → Rerank。
+    適用於需要推理、比較或了解完整流程的複雜問題。
     """
-    # ── 步驟 0：指代消解 ──────────────────────────────
-    # 將 "那三國殺呢？" 這類問題利用歷史改寫成獨立問題
-    resolved_question = rewrite_query_with_history(question, chat_history or [])
-    if resolved_question != question:
-        logger.info(f"DeepRAG 開始 (改寫後): 「{resolved_question}」")
-    else:
-        logger.info(f"DeepRAG 開始: 「{question}」")
+    logger.info(f"DeepRAG 路徑開始 (最多 {max_rounds} 輪): 「{resolved_question}」")
 
     # ── 步驟 1：初始混合檢索 ──────────────────────────
     initial_docs = hybrid_search(resolved_question, vector_store, bm25_retriever)
@@ -411,30 +493,26 @@ def deep_rag_retrieve(
     all_queries = [resolved_question]
     seen_ctx = {init_ctx.strip()} if init_ctx.strip() else set()
 
-    # 累積所有檢索到的候選文件（去重），供步驟 3 Rerank 用
     candidate_docs: list[Document] = []
     seen_doc_texts: set[str] = set()
 
-    def _collect_candidates(docs: list[Document]) -> None:
+    def _collect(docs: list[Document]) -> None:
         for d in docs:
             t = d.page_content.strip()
             if t and t not in seen_doc_texts:
                 seen_doc_texts.add(t)
                 candidate_docs.append(d)
 
-    _collect_candidates(initial_docs)
+    _collect(initial_docs)
 
     # ── 步驟 1b：粵語 BM25 展開搜尋 ──────────────────
-    # 如果原始問題含粵語，用術語對照表產生書面語 queries 補充搜尋
-    cantonese_expansions = expand_cantonese_terms(question)
-    for exp_q in cantonese_expansions:
+    for exp_q in expand_cantonese_terms(original_question):
         if exp_q not in all_queries:
             all_queries.append(exp_q)
-            exp_docs = hybrid_search(exp_q, vector_store, bm25_retriever)
-            _collect_candidates(exp_docs)
+            _collect(hybrid_search(exp_q, vector_store, bm25_retriever))
 
-    # ── 步驟 2：多輪迭代（充足性判斷 → follow-up） ──
-    for rnd in range(DEEPRAG_MAX_ROUNDS):
+    # ── 步驟 2：多輪迭代 ────────────────────────────
+    for rnd in range(max_rounds):
         merged = "\n\n---\n\n".join(all_contexts).strip()
         if is_context_sufficient(resolved_question, merged):
             logger.info(f"第 {rnd+1} 輪: 充足，停止")
@@ -450,7 +528,7 @@ def deep_rag_retrieve(
                 continue
             all_queries.append(q)
             new_docs = hybrid_search(q, vector_store, bm25_retriever)
-            _collect_candidates(new_docs)
+            _collect(new_docs)
             new_ctx = "\n\n".join([d.page_content for d in new_docs])
             if not new_ctx.strip() or new_ctx.strip() in seen_ctx:
                 continue
@@ -460,7 +538,7 @@ def deep_rag_retrieve(
         if not new_found:
             break
 
-    # ── 步驟 3：Rerank（直接複用已收集的候選文件）───
+    # ── 步驟 3：Rerank ───────────────────────────────
     reranked = llm_rerank(resolved_question, candidate_docs)
     if reranked:
         final = "\n\n---\n\n".join([d.page_content for d in reranked]).strip()
@@ -469,4 +547,53 @@ def deep_rag_retrieve(
 
     logger.info(f"DeepRAG 完成: {len(all_queries)} queries, {len(reranked)} 段")
     return final, all_queries, reranked
+
+
+# ==============================
+# 路由器：根據問題複雜度選擇路徑
+# ==============================
+def deep_rag_retrieve(
+    question: str,
+    vector_store: Chroma,
+    bm25_retriever: Optional[BM25Retriever] = None,
+    chat_history: Optional[ChatHistory] = None,
+) -> tuple[str, list[str], list[Document], str]:
+    """
+    智慧路由器：先分類問題複雜度，再分派到對應的檢索路徑。
+
+    Returns: (final_context, all_queries, reranked_docs, query_type)
+      - query_type: FACTOID / PROCEDURAL / REASONING / COMPARISON
+    """
+    # ── 步驟 0：指代消解 + 粵語改寫 ──────────────────
+    resolved_question = rewrite_query_with_history(question, chat_history or [])
+    if resolved_question != question:
+        logger.info(f"改寫後: 「{resolved_question}」")
+
+    # ── 步驟 1：問題複雜度分類 ───────────────────────
+    query_type = classify_query_complexity(resolved_question)
+
+    # ── 步驟 2：根據分類選擇路徑 ─────────────────────
+    if query_type == QUERY_TYPE_FACTOID:
+        # 簡單事實查詢 → Standard 路徑（不迭代）
+        ctx, queries, docs = _standard_retrieve(
+            resolved_question, vector_store, bm25_retriever
+        )
+
+    elif query_type == QUERY_TYPE_PROCEDURAL:
+        # 流程步驟 → DeepRAG 輕量（1 輪迭代）
+        ctx, queries, docs = _deep_retrieve(
+            resolved_question, question, vector_store,
+            bm25_retriever, chat_history,
+            max_rounds=DEEPRAG_PROCEDURAL_ROUNDS,
+        )
+
+    else:
+        # REASONING / COMPARISON → DeepRAG 完整路徑
+        ctx, queries, docs = _deep_retrieve(
+            resolved_question, question, vector_store,
+            bm25_retriever, chat_history,
+            max_rounds=DEEPRAG_MAX_ROUNDS,
+        )
+
+    return ctx, queries, docs, query_type
 
