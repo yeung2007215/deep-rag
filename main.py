@@ -114,18 +114,18 @@ def show_game_menu() -> str | None:
     game_keys = list(GAME_COLLECTIONS.keys())
 
     print("\n" + "=" * 60)
-    print("🎲 DeepRAG 桌遊規則問答系統")
+    print("🎲 DeepRAG Boardgame rule assistant")
     print("=" * 60)
-    print("\n請選擇要查詢的遊戲：\n")
+    print("\nPlease select a game to query:\n")
     for i, key in enumerate(game_keys, 1):
         name = GAME_COLLECTIONS[key]["name"]
         print(f"  {i}. {name}")
-    print(f"\n  輸入 'quit' 或 'exit' 退出程式")
+    print(f"\n  Enter 'quit' or 'exit' to exit the program")
     print("-" * 40)
 
     while True:
         try:
-            choice = input("\n🎮 請輸入編號: ").strip()
+            choice = input("\n🎮 Enter game No.: ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
 
@@ -155,7 +155,7 @@ def question_loop(game_key: str) -> bool:
     collection_name = game_info["collection"]
 
     # 連接對應的向量資料庫
-    print(f"\n🔗 連接 {game_name} 向量資料庫 ({collection_name})...")
+    print(f"\n🔗 Connecting to {game_name} vector database ({collection_name})...")
     vector_store = get_vector_store(collection_name)
 
     # 建立 BM25 索引（只建一次，整個 session 複用）
@@ -168,10 +168,10 @@ def question_loop(game_key: str) -> bool:
         print(f"   📚 BM25 索引: {len(bm25_docs)} 個文件")
 
     print("\n" + "=" * 60)
-    print(f"📖 目前遊戲: {game_name}")
-    print("   輸入 'back' 返回遊戲選擇（對話記憶將清除）")
-    print("   輸入 'quit' 或 'exit' 退出程式")
-    print("   輸入 'history' 查看目前對話記憶")
+    print(f"📖 Current game: {game_name}")
+    print("   Enter 'back' to return to game selection (chat history will be cleared)")
+    print("   Enter 'quit' or 'exit' to exit the program")
+    print("   Enter 'history' to view current chat history")
     print("=" * 60)
 
     # 對話歷史：每進入一個遊戲就重新開始累積
@@ -179,9 +179,9 @@ def question_loop(game_key: str) -> bool:
 
     while True:
         try:
-            question = input(f"\n❓ [{game_name}] 請輸入問題: ").strip()
+            question = input(f"\n❓ [{game_name}] Enter question: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n\n👋 再見！")
+            print("\n\n👋 Good game！Bye!")
             return False
 
         if not question:
@@ -194,7 +194,7 @@ def question_loop(game_key: str) -> bool:
             return True
 
         if lower_q in ("quit", "exit", "q"):
-            print("\n👋 再見！")
+            print("\n👋 Good game！Bye!")
             return False
 
         if lower_q == "history":
@@ -213,7 +213,7 @@ def question_loop(game_key: str) -> bool:
             bm25_retriever=bm25_retriever,
             chat_history=chat_history,
         )
-        print(f"\n🤖 回答:\n{answer}")
+        print(f"\n🤖 Answer:\n{answer}")
 
         # 將本輪問答加入歷史，超過上限時淘汰最舊的
         chat_history.append((question, answer))
@@ -228,17 +228,17 @@ def main():
     # 處理 --ingest 命令
     if "--ingest" in sys.argv:
         from ingestion import ingest
-        print("📥 執行文件索引（所有遊戲）...")
+        print("📥 Executing document indexing (all games)...")
         ingest(force="--force" in sys.argv)
         if "--interactive" not in sys.argv:
-            print("\n✅ 索引完成。加上 --interactive 可直接進入問答模式。")
+            print("\n✅ Indexing complete. Add --interactive to QA mode.")
             return
 
     # 處理 --query 單次查詢模式
     if "--query" in sys.argv:
         idx = sys.argv.index("--query")
         if idx + 1 >= len(sys.argv):
-            print("❌ 請在 --query 後面提供問題")
+            print("❌ Please provide a question after --query")
             return
         question = sys.argv[idx + 1]
 
@@ -251,8 +251,8 @@ def main():
                 game_key = sys.argv[gi + 1]
 
         if game_key not in GAME_COLLECTIONS:
-            print(f"❌ 未知遊戲: {game_key}")
-            print(f"   可選: {', '.join(game_keys)}")
+            print(f"❌ Unknown game: {game_key}")
+            print(f"   Available: {', '.join(game_keys)}")
             return
 
         game_info = GAME_COLLECTIONS[game_key]
@@ -260,14 +260,14 @@ def main():
         bm25 = build_bm25_retriever(get_all_documents(vs))
         # CLI 單次查詢無對話歷史
         answer = ask(question, vs, game_info["name"], bm25_retriever=bm25, chat_history=None)
-        print(f"\n🤖 回答:\n{answer}")
+        print(f"\n🤖 Answer:\n{answer}")
         return
 
     # 巢狀循環：第一層（遊戲選擇）→ 第二層（問題諮詢）
     while True:
         game_key = show_game_menu()
         if game_key is None:
-            print("\n👋 再見！")
+            print("\n👋 Good game！Bye!")
             break
 
         # 進入第二層問答；回傳 True 表示 back，False 表示 quit

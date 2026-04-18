@@ -116,6 +116,9 @@ while True:
             # Only for develpr testing: print retrieved chunks for reference
             retrieved_docs = current_vector_store.similarity_search(question, k=10)
             print(f"\n[AI reference]: Seacrhed chunks: {len(retrieved_docs)} ")
+
+
+            #Print retrieved chunks with source information
             for index, doc in enumerate(retrieved_docs):
                 print(f"=====[AI reference: Chunk no.{index+1}]=====")
                 # Print first 500 characters, and add source information (if available)
